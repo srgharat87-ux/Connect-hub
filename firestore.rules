@@ -1,0 +1,113 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Validation Helpers ---
+    function isValidUser(data) {
+      return data.keys().hasAll(['displayName', 'email']) &&
+             data.displayName is string && data.displayName.size() <= 100 &&
+             data.email is string && data.email.size() <= 150 &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500)) &&
+             (!('about' in data) || (data.about is string && data.about.size() <= 500));
+    }
+
+    function isValidGroup(data) {
+      return data.keys().hasAll(['name', 'createdBy', 'createdAt']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.createdBy == request.auth.uid &&
+             data.createdAt == request.time;
+    }
+
+    function isValidMessage(data) {
+      return data.keys().hasAll(['text', 'senderId', 'createdAt', 'groupId']) &&
+             data.text is string && data.text.size() <= 5000 &&
+             data.senderId == request.auth.uid &&
+             data.createdAt == request.time &&
+             data.groupId is string && isValidId(data.groupId);
+    }
+
+    function isGroupMember(groupId, userId) {
+      return exists(/databases/$(database)/documents/groups/$(groupId)/members/$(userId));
+    }
+
+    // --- Collection Routes ---
+
+    // Users
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn(); // We might need to search for users to add them
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && isValidUser(incoming()) && 
+                    incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'about', 'status', 'lastSeen']);
+    }
+
+    // Groups
+    match /groups/{groupId} {
+      allow get: if isSignedIn() && isGroupMember(groupId, request.auth.uid);
+      allow list: if isSignedIn(); // Users can see groups they belong to (query filtered)
+      allow create: if isEmailVerified() && isValidGroup(incoming());
+      allow update: if isSignedIn() && isGroupMember(groupId, request.auth.uid) && 
+                    (
+                      // Admin update
+                      get(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)).data.role == 'admin' ||
+                      // System update (last message)
+                      incoming().diff(existing()).affectedKeys().hasOnly(['lastMessage', 'lastMessageTime'])
+                    );
+      
+      // Members subcollection
+      match /members/{memberId} {
+        allow get: if isSignedIn() && isGroupMember(groupId, request.auth.uid);
+        allow list: if isSignedIn() && isGroupMember(groupId, request.auth.uid);
+        allow create: if isEmailVerified() && (
+          // Creating own membership (joining) or admin adding someone
+          (isOwner(memberId)) || 
+          (isGroupMember(groupId, request.auth.uid) && get(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)).data.role == 'admin')
+        );
+        allow delete: if isSignedIn() && (isOwner(memberId) || get(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)).data.role == 'admin');
+      }
+
+      // Messages subcollection
+      match /messages/{messageId} {
+        allow list: if isSignedIn() && isGroupMember(groupId, request.auth.uid);
+        allow create: if isEmailVerified() && isGroupMember(groupId, request.auth.uid) && isValidMessage(incoming());
+      }
+    }
+
+    // Denormalized user-groups list
+    match /users/{userId}/groups/{groupId} {
+      allow read: if isOwner(userId);
+      allow write: if false; // Only updated via backend or atomic batch (not implemented here yet, usually system-driven)
+      // For simplicity in this demo, let's allow users to manage their own group list for now if they are members
+      allow create, delete: if isOwner(userId) && isGroupMember(groupId, request.auth.uid);
+    }
+  }
+}
